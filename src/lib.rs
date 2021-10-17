@@ -1,3 +1,7 @@
+//! Reading, validating and parsing of [`KTX v.2`] files.  
+//! **Currently SUPER COMPRESSION is NOT supported.**
+//!
+//! [`KTX v.2`]: https://github.khronos.org/KTX-Specification/
 pub mod error;
 pub mod format;
 
@@ -6,20 +10,27 @@ use crate::format::Format;
 use crate::error::{ParseError, ReadError, ReadToError};
 use byteorder::{ByteOrder, NativeEndian};
 use std::convert::TryInto;
-use std::io::SeekFrom;
-use tokio::io::AsyncSeek;
-use tokio::prelude::*;
 
-pub struct Reader<T> {
-    input: T,
+/// Struct to read [`KTX v.2`] files.  
+///
+/// [`KTX v.2`]: https://github.khronos.org/KTX-Specification/
+pub struct Reader<Data: AsRef<[u8]>> {
+    input: Data,
     head: Header,
-    levels_index: Vec<LevelInfo>,
+    levels_index: Vec<LevelIndex>,
 }
-
-impl<T: AsyncRead + AsyncSeek + Unpin> Reader<T> {
-    pub async fn new(mut input: T) -> ReadResult<Self> {
-        let head = Self::read_head(&mut input).await?;
-        let levels_index = Self::read_level_index(&mut input, &head).await?;
+impl<Data: AsRef<[u8]>> Reader<Data> {
+    /// Create new instance of Reader.  
+    /// Asyncroniosly reads and tries to parse data from `input`.
+    /// # Errors
+    /// If reading fails, returns [`ReadError::IoError`].  
+    /// If parsing fails, returns [`ReadError::ParseError`].
+    ///
+    /// [`ReadError::IoError`]: error/enum.ReadError.html#variant.IoError
+    /// [`ReadError::ParseError`]: error/enum.ReadError.html#variant.ParseError
+    pub fn new(input: Data) -> ReadResult<Self> {
+        let head = Self::read_head(input.as_ref())?;
+        let levels_index = Self::read_level_index(input.as_ref(), &head)?;
         Ok(Self {
             input,
             head,
@@ -27,79 +38,63 @@ impl<T: AsyncRead + AsyncSeek + Unpin> Reader<T> {
         })
     }
 
-    async fn read_head(input: &mut T) -> ReadResult<Header> {
-        let mut head_bytes = [0; 48];
-        input.read_exact(&mut head_bytes).await?;
-        Self::test_identifier(&head_bytes)?;
-
-        Ok(Header::from_bytes(&head_bytes)?)
+    /// Reads and tries to parse header of texture.  
+    fn read_head(input: &[u8]) -> ReadResult<Header> {
+        let head_bytes: HeadBytes = input[0..48].try_into().unwrap();
+        Self::test_identifier(head_bytes)?;
+        Ok(Header::from_bytes(head_bytes)?)
     }
 
-    async fn read_level_index(input: &mut T, head: &Header) -> ReadResult<Vec<LevelInfo>> {
-        const LEVEL_INDEX_START_BYTE: u64 = 80;
-        const LEVEL_INDEX_BYTE_LEN: u32 = 24;
+    /// Reads and tries to parse level index of texture.  
+    ///
+    /// [Level index](https://github.khronos.org/KTX-Specification/#_level_index) is a description of texture data layout.
+    fn read_level_index(input: &[u8], head: &Header) -> ReadResult<Vec<LevelIndex>> {
+        const LEVEL_INDEX_START_BYTE: usize = 80;
+        const LEVEL_INDEX_BYTE_LEN: usize = 24;
         let level_count = head.level_count.max(1);
-        let level_index_bytes_len = level_count * LEVEL_INDEX_BYTE_LEN;
-        let mut level_index_bytes: Vec<u8> = (0..level_index_bytes_len).map(|_| 0u8).collect();
 
-        input.seek(SeekFrom::Start(LEVEL_INDEX_START_BYTE)).await?;
-        input.read_exact(&mut level_index_bytes).await?;
+        let level_index_end_byte =
+            LEVEL_INDEX_START_BYTE + level_count as usize * LEVEL_INDEX_BYTE_LEN;
+        let level_index_bytes = &input[LEVEL_INDEX_START_BYTE..level_index_end_byte];
+
         let mut infos = Vec::with_capacity(level_count as usize);
         for level_index in 0..level_count {
-            let start_byte = (level_index * LEVEL_INDEX_BYTE_LEN) as usize;
+            let start_byte = level_index as usize * LEVEL_INDEX_BYTE_LEN;
             let end_byte = start_byte + LEVEL_INDEX_BYTE_LEN as usize;
-            infos.push(LevelInfo::from_bytes(
+            infos.push(LevelIndex::from_bytes(
                 &level_index_bytes[start_byte..end_byte],
             ))
         }
         Ok(infos)
     }
 
-    pub async fn read_data(&mut self) -> ReadResult<Vec<u8>> {
-        let data_len_bytes = self.data_len_bytes();
-        let mut buffer = Vec::new();
-        buffer.resize(data_len_bytes as usize, 0);
-        self.read_data_to(&mut buffer)
-            .await
-            .map(|_| buffer)
-            .map_err(|e| match e {
-                ReadToError::ReadError(e) => e,
-                ReadToError::BadBuffer(_) => {
-                    panic!("Pass well sized buffer to read_data_to(), but got BadBuffer error")
-                }
-            })
+    pub fn read_data(&self) -> ReadResult<&[u8]> {
+        let data_len_bytes = self.data_len_bytes() as usize;
+
+        let data_start_byte = self.first_level_offset_bytes() as usize;
+        let data_end_byte = data_start_byte + data_len_bytes;
+        Ok(&self.input.as_ref()[data_start_byte..data_end_byte])
     }
 
-    pub async fn read_data_to(&mut self, buf: &mut [u8]) -> ReadToResult<()> {
-        let data_len_bytes = self.data_len_bytes();
-        if buf.len() != data_len_bytes as usize {
-            return Err(ReadToError::BadBuffer(data_len_bytes));
-        }
-
-        let data_start_byte = self.first_level_offset_bytes();
-        self.input.seek(SeekFrom::Start(data_start_byte)).await?;
-
-        self.input.read_exact(buf).await?;
-        Ok(())
-    }
-
-    fn test_identifier(head_bytes: &HeadBytes) -> ReadResult<()> {
-        let mut red_id = [0; 12];
-        red_id.copy_from_slice(&head_bytes[0..12]);
-        if red_id == KTX2_IDENTIFIER {
+    /// Tests first 12 bytes of input. If identifier is wrong,
+    /// returns [`ReadError::ParseError`](error/enum.ReadError.html#variant.ParseError)
+    /// with [`ParseError::BadIdentifier`](error/enum.ParseError.html#variant.BadIdentifier).
+    fn test_identifier(head_bytes: HeadBytes<'_>) -> ReadResult<()> {
+        let ident_bytes: &[u8; 12] = head_bytes[0..12].try_into().unwrap();
+        if ident_bytes == &KTX2_IDENTIFIER {
             return Ok(());
         }
-        Err(ReadError::ParseError(ParseError::BadIdentifier(red_id)))
+        Err(ReadError::ParseError(ParseError::BadIdentifier(
+            *ident_bytes,
+        )))
     }
 
-    pub fn header(&self) -> &Header {
-        &self.head
+    /// Returns [`Header`](struct.Header.html) of texture.
+    pub fn header(&self) -> Header {
+        self.head
     }
 
-    pub fn levels_index(&self) -> &Vec<LevelInfo> {
-        &self.levels_index
-    }
-
+    /// Returns vector of [`RegionDescription`](struct.RegionDescription.html) for texture.
     pub fn regions_description(&self) -> Vec<RegionDescription> {
         let base_offset = self.first_level_offset_bytes();
         self.levels_index
@@ -109,6 +104,7 @@ impl<T: AsyncRead + AsyncSeek + Unpin> Reader<T> {
             .collect()
     }
 
+    /// Start of texture data oofset in bytes.
     fn first_level_offset_bytes(&self) -> u64 {
         self.levels_index
             .iter()
@@ -117,7 +113,8 @@ impl<T: AsyncRead + AsyncSeek + Unpin> Reader<T> {
             .expect("No levels got, but read some on constructing")
     }
 
-    pub fn last_level(&self) -> LevelInfo {
+    /// Last (by data offset) level in texture data.
+    fn last_level(&self) -> LevelIndex {
         *self
             .levels_index
             .iter()
@@ -125,12 +122,14 @@ impl<T: AsyncRead + AsyncSeek + Unpin> Reader<T> {
             .expect("No levels got, but read some on constructing")
     }
 
+    /// Full length of texture data.
     pub fn data_len_bytes(&self) -> u64 {
         let start_offset = self.first_level_offset_bytes();
         let last_level = self.last_level();
         last_level.offset + last_level.uncompressed_length_bytes - start_offset
     }
 
+    /// Crates region info from level info.
     fn region_from_level_index(&self, i: usize, offset: u64) -> RegionDescription {
         RegionDescription {
             level: i as u32,
@@ -142,24 +141,27 @@ impl<T: AsyncRead + AsyncSeek + Unpin> Reader<T> {
         }
     }
 
+    /// Size in pixels of `level`, with `base` size.
     fn level_size(base: u32, level: u32) -> u32 {
         (base >> level).max(1)
     }
 }
 
+/// Identifier, expected in start of input texture data.
 static KTX2_IDENTIFIER: [u8; 12] = [
     0xAB, 0x4B, 0x54, 0x58, 0x20, 0x32, 0x30, 0xBB, 0x0D, 0x0A, 0x1A, 0x0A,
 ];
 
+/// Result of read data operation.
 pub type ReadResult<T> = Result<T, ReadError>;
+
+/// Result of reading data to buffer operation.
 pub type ReadToResult<T> = Result<T, ReadToError>;
+
+/// Result of parsing data operation.
 pub type ParseResult<T> = Result<T, ParseError>;
 
-pub struct TexData {
-    pub header: Header,
-    pub frames: Vec<RegionDescription>,
-}
-
+/// Header of texture. Contains general information.
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub struct Header {
     pub format: Format,
@@ -174,7 +176,8 @@ pub struct Header {
 }
 
 impl Header {
-    pub fn from_bytes(data: &HeadBytes) -> ParseResult<Self> {
+    /// Crates Header from bytes array.
+    pub fn from_bytes(data: HeadBytes) -> ParseResult<Self> {
         let format_id = NativeEndian::read_u32(&data[12..16]);
         let format = format_id.try_into()?;
 
@@ -216,16 +219,18 @@ impl Header {
     }
 }
 
-type HeadBytes = [u8; 48];
+/// Array, that stores data of start of texture.
+type HeadBytes<'a> = &'a [u8; 48];
 
+/// Struct, that contains size and offset information about levels.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
-pub struct LevelInfo {
+struct LevelIndex {
     pub offset: u64,
     pub length_bytes: u64,
     pub uncompressed_length_bytes: u64,
 }
 
-impl LevelInfo {
+impl LevelIndex {
     pub fn from_bytes(data: &[u8]) -> Self {
         Self {
             offset: NativeEndian::read_u64(&data[0..8]),
@@ -235,6 +240,7 @@ impl LevelInfo {
     }
 }
 
+/// Describe texture regions e.g. mip-levels and layers.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub struct RegionDescription {
     pub level: u32,
